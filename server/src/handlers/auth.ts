@@ -1,60 +1,229 @@
 
+import { db } from '../db';
+import { usersTable } from '../db/schema';
 import { type LoginInput, type RegisterInput, type User } from '../schema';
+import { eq } from 'drizzle-orm';
+
+const JWT_SECRET = process.env['JWT_SECRET'] || 'default-secret-key';
+const JWT_EXPIRES_IN = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+// Simple JWT implementation using Bun's crypto
+async function createJWT(payload: any): Promise<string> {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Date.now();
+  const exp = now + JWT_EXPIRES_IN;
+  
+  const jwtPayload = { ...payload, iat: now, exp };
+  
+  const encodedHeader = btoa(JSON.stringify(header));
+  const encodedPayload = btoa(JSON.stringify(jwtPayload));
+  
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(JWT_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const signatureBuffer = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`)
+  );
+  
+  const signature = btoa(
+    Array.from(new Uint8Array(signatureBuffer))
+      .map(b => String.fromCharCode(b))
+      .join('')
+  );
+  
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+
+async function verifyJWT(token: string): Promise<any> {
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Invalid token format');
+  }
+  
+  const [encodedHeader, encodedPayload, signature] = parts;
+  
+  // Verify signature
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(JWT_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const signatureBuffer = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`)
+  );
+  
+  const expectedSignature = btoa(
+    Array.from(new Uint8Array(signatureBuffer))
+      .map(b => String.fromCharCode(b))
+      .join('')
+  );
+  
+  if (signature !== expectedSignature) {
+    throw new Error('Invalid token signature');
+  }
+  
+  // Decode payload
+  const payload = JSON.parse(atob(encodedPayload));
+  
+  // Check expiration
+  if (payload.exp && Date.now() > payload.exp) {
+    throw new Error('Token expired');
+  }
+  
+  return payload;
+}
+
+// Token blacklist (in production, use Redis or database)
+const tokenBlacklist = new Set<string>();
 
 export async function login(input: LoginInput): Promise<{ user: User; token: string }> {
-  // This is a placeholder declaration! Real code should be implemented here.
-  // The goal of this handler is to authenticate user credentials and return user data with JWT token.
-  // Should validate username/password, check if user is active, and generate secure JWT token.
-  return Promise.resolve({
-    user: {
-      id: 1,
-      username: input.username,
-      email: 'user@example.com',
-      password_hash: 'hashed_password',
-      role: 'PENDUDUK',
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date()
-    } as User,
-    token: 'jwt_token_placeholder'
-  });
+  try {
+    // Find user by username
+    const users = await db.select()
+      .from(usersTable)
+      .where(eq(usersTable.username, input.username))
+      .execute();
+
+    if (users.length === 0) {
+      throw new Error('Invalid username or password');
+    }
+
+    const user = users[0];
+
+    // Check if user is active
+    if (!user.is_active) {
+      throw new Error('Account is deactivated');
+    }
+
+    // Verify password (using Bun's built-in password verification)
+    const isPasswordValid = await Bun.password.verify(input.password, user.password_hash);
+    if (!isPasswordValid) {
+      throw new Error('Invalid username or password');
+    }
+
+    // Generate JWT token
+    const token = await createJWT({
+      userId: user.id,
+      username: user.username,
+      role: user.role
+    });
+
+    // Return user without password hash
+    const { password_hash, ...userWithoutPassword } = user;
+    
+    return {
+      user: userWithoutPassword as User,
+      token
+    };
+  } catch (error) {
+    console.error('Login failed:', error);
+    throw error;
+  }
 }
 
 export async function register(input: RegisterInput): Promise<User> {
-  // This is a placeholder declaration! Real code should be implemented here.
-  // The goal of this handler is to create a new user account with hashed password.
-  // Should validate input, hash password, check for existing username/email, and persist to database.
-  return Promise.resolve({
-    id: 1,
-    username: input.username,
-    email: input.email,
-    password_hash: 'hashed_password',
-    role: input.role,
-    is_active: true,
-    created_at: new Date(),
-    updated_at: new Date()
-  } as User);
+  try {
+    // Check if username already exists
+    const existingUsers = await db.select()
+      .from(usersTable)
+      .where(eq(usersTable.username, input.username))
+      .execute();
+
+    if (existingUsers.length > 0) {
+      throw new Error('Username already exists');
+    }
+
+    // Check if email already exists
+    const existingEmails = await db.select()
+      .from(usersTable)
+      .where(eq(usersTable.email, input.email))
+      .execute();
+
+    if (existingEmails.length > 0) {
+      throw new Error('Email already exists');
+    }
+
+    // Hash password
+    const password_hash = await Bun.password.hash(input.password);
+
+    // Insert new user
+    const result = await db.insert(usersTable)
+      .values({
+        username: input.username,
+        email: input.email,
+        password_hash,
+        role: input.role,
+        is_active: true
+      })
+      .returning()
+      .execute();
+
+    const newUser = result[0];
+    
+    // Return user without password hash
+    const { password_hash: _, ...userWithoutPassword } = newUser;
+    return userWithoutPassword as User;
+  } catch (error) {
+    console.error('Registration failed:', error);
+    throw error;
+  }
 }
 
 export async function logout(token: string): Promise<{ success: boolean }> {
-  // This is a placeholder declaration! Real code should be implemented here.
-  // The goal of this handler is to invalidate the user's JWT token.
-  // Should add token to blacklist or remove from active sessions.
-  return Promise.resolve({ success: true });
+  try {
+    // Add token to blacklist
+    tokenBlacklist.add(token);
+    return { success: true };
+  } catch (error) {
+    console.error('Logout failed:', error);
+    throw error;
+  }
 }
 
 export async function validateToken(token: string): Promise<User | null> {
-  // This is a placeholder declaration! Real code should be implemented here.
-  // The goal of this handler is to validate JWT token and return user data.
-  // Should verify token signature, check expiration, and return user if valid.
-  return Promise.resolve({
-    id: 1,
-    username: 'user',
-    email: 'user@example.com',
-    password_hash: 'hashed_password',
-    role: 'PENDUDUK',
-    is_active: true,
-    created_at: new Date(),
-    updated_at: new Date()
-  } as User);
+  try {
+    // Check if token is blacklisted
+    if (tokenBlacklist.has(token)) {
+      return null;
+    }
+
+    // Verify JWT token
+    const decoded = await verifyJWT(token);
+
+    // Find user in database
+    const users = await db.select()
+      .from(usersTable)
+      .where(eq(usersTable.id, decoded.userId))
+      .execute();
+
+    if (users.length === 0) {
+      return null;
+    }
+
+    const user = users[0];
+
+    // Check if user is still active
+    if (!user.is_active) {
+      return null;
+    }
+
+    // Return user without password hash
+    const { password_hash, ...userWithoutPassword } = user;
+    return userWithoutPassword as User;
+  } catch (error) {
+    console.error('Token validation failed:', error);
+    return null;
+  }
 }
